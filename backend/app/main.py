@@ -1,0 +1,125 @@
+"""Small API-key-safe proxy for Kakao Local and ODsay route lookup."""
+import os
+from typing import Any
+
+import httpx
+import numpy as np
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="AI Departure Coach API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(","),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+
+class RouteRequest(BaseModel):
+    origin: str = Field(min_length=1, max_length=200)
+    destination: str = Field(min_length=1, max_length=200)
+
+
+class PersonalizationRequest(BaseModel):
+    base_minutes: int = Field(ge=1, le=600)
+    valid_durations_minutes: list[float] = Field(default_factory=list, max_length=500)
+    alpha: float = Field(default=0.25, gt=0, le=1)
+    cold_start_k: int = Field(default=8, ge=1, le=100)
+    quantile_threshold: int = Field(default=10, ge=2, le=100)
+
+
+@app.get("/api/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/personalize")
+async def personalize(payload: PersonalizationRequest) -> dict[str, Any]:
+    """Optional server-side mirror of the offline browser estimator."""
+    values = np.asarray([v for v in payload.valid_durations_minutes if np.isfinite(v) and v > 0], dtype=float)
+    if values.size == 0:
+        return {"predicted_minutes": payload.base_minutes, "ewma_minutes": None, "sample_count": 0, "method": "cold_start"}
+    ewma = float(values[0])
+    for actual in values[1:]:
+        ewma = payload.alpha * float(actual) + (1 - payload.alpha) * ewma
+    individual = ewma
+    method = "ewma"
+    if values.size >= payload.quantile_threshold:
+        q80 = float(np.quantile(values[-20:], 0.8, method="linear"))
+        individual = max(ewma, q80)
+        method = "ewma_q80"
+    weight = values.size / (values.size + payload.cold_start_k)
+    estimate = (1 - weight) * payload.base_minutes + weight * individual
+    return {"predicted_minutes": int(np.ceil(estimate)), "ewma_minutes": round(ewma, 2), "individual_minutes": round(individual, 2), "sample_count": int(values.size), "method": method}
+
+
+@app.get("/api/places")
+async def places(q: str = Query(min_length=1, max_length=100)) -> dict[str, Any]:
+    key = os.getenv("KAKAO_REST_API_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="Kakao Local API key is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            res = await client.get(
+                "https://dapi.kakao.com/v2/local/search/keyword.json",
+                params={"query": q, "size": 8},
+                headers={"Authorization": f"KakaoAK {key}"},
+            )
+            res.raise_for_status()
+            docs = res.json().get("documents", [])
+            return {"results": [{"name": x.get("place_name", ""), "address": x.get("road_address_name") or x.get("address_name", ""), "x": x.get("x"), "y": x.get("y")} for x in docs]}
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Kakao Local API lookup failed") from exc
+
+
+async def geocode(client: httpx.AsyncClient, query: str, key: str) -> tuple[float, float]:
+    response = await client.get(
+        "https://dapi.kakao.com/v2/local/search/address.json",
+        params={"query": query, "size": 1},
+        headers={"Authorization": f"KakaoAK {key}"},
+    )
+    response.raise_for_status()
+    docs = response.json().get("documents", [])
+    if not docs:
+        response = await client.get(
+            "https://dapi.kakao.com/v2/local/search/keyword.json",
+            params={"query": query, "size": 1},
+            headers={"Authorization": f"KakaoAK {key}"},
+        )
+        response.raise_for_status()
+        docs = response.json().get("documents", [])
+    if not docs:
+        raise HTTPException(status_code=404, detail=f"Could not locate: {query}")
+    return float(docs[0]["x"]), float(docs[0]["y"])
+
+
+@app.post("/api/route")
+async def route(payload: RouteRequest) -> dict[str, Any]:
+    kakao = os.getenv("KAKAO_REST_API_KEY")
+    odsay = os.getenv("ODSAY_API_KEY")
+    if not kakao or not odsay:
+        raise HTTPException(status_code=503, detail="Route lookup keys are not configured")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            origin, destination = await __import__("asyncio").gather(
+                geocode(client, payload.origin, kakao), geocode(client, payload.destination, kakao)
+            )
+            res = await client.get(
+                "https://api.odsay.com/v1/api/searchPubTransPathT",
+                params={"SX": origin[0], "SY": origin[1], "EX": destination[0], "EY": destination[1], "apiKey": odsay},
+            )
+            res.raise_for_status()
+            body = res.json()
+            paths = body.get("result", {}).get("path", [])
+            if not paths:
+                raise HTTPException(status_code=404, detail="No transit route found")
+            path = paths[0]
+            info = path.get("info", {})
+            return {"duration_minutes": int(info.get("totalTime", 0)), "source": "ODsay 대중교통 경로", "transfers": info.get("payment", 0) and max(0, len(path.get("subPath", [])) - 1), "fare": info.get("payment"), "realtime": False}
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Transit route lookup failed") from exc
