@@ -1,5 +1,6 @@
 """Small API-key-safe proxy for Kakao Local and ODsay route lookup."""
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -7,6 +8,18 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
+
+from .travel import calculate_arrival_metrics, compute_travel_record, predict_travel_duration, recommend_departure, route_group_key
+from .travel_schemas import (
+    TravelCompleteResponse,
+    TravelMetricsRequest,
+    TravelMetricsResponse,
+    TravelPlanRequest,
+    TravelPlanResponse,
+    TravelPredictRequest,
+    TravelPredictResponse,
+    TravelRecord,
+)
 
 app = FastAPI(title="AI Departure Coach API", version="1.0.0")
 app.add_middleware(
@@ -133,8 +146,58 @@ async def route(payload: RouteRequest) -> dict[str, Any]:
             rides = [part for part in path.get("subPath", []) if part.get("trafficType") in (1, 2)]
             transfers = max(0, len(rides) - 1) if rides else None
             payment = info.get("payment")
-            return {"duration_minutes": int(duration), "source": "ODsay 대중교통 경로", "transfers": transfers, "fare": payment if isinstance(payment, (int, float)) and payment > 0 else None, "realtime": False}
+            raw_signature = info.get("mapObj")
+            route_signature = raw_signature.strip()[:256] if isinstance(raw_signature, str) and raw_signature.strip() else None
+            route_key = route_group_key(origin, destination, route_signature)
+            return {
+                "duration_minutes": int(duration),
+                "source": "ODsay 대중교통 경로",
+                "transfers": transfers,
+                "fare": payment if isinstance(payment, (int, float)) and payment > 0 else None,
+                "realtime": False,
+                "route_key": route_key,
+                "route_signature": route_signature,
+                "route_identity_source": "odsay_map_object" if route_signature else "endpoint_coordinate_group",
+                "route_grouping": "endpoint_coordinates_0.001deg",
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "prediction_source": "api",
+            }
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Transit route lookup failed") from exc
+
+
+@app.post("/api/travel/predict", response_model=TravelPredictResponse)
+async def travel_predict(payload: TravelPredictRequest) -> TravelPredictResponse:
+    return predict_travel_duration(
+        route_key=payload.route_key,
+        base_travel_minutes=payload.base_travel_minutes,
+        prediction_source=payload.prediction_source,
+        strategy=payload.strategy,
+        history=payload.history,
+    )
+
+
+@app.post("/api/travel/plan", response_model=TravelPlanResponse)
+async def travel_plan(payload: TravelPlanRequest) -> TravelPlanResponse:
+    return recommend_departure(payload)
+
+
+@app.post("/api/travel/complete", response_model=TravelCompleteResponse)
+async def travel_complete(payload: TravelRecord) -> TravelCompleteResponse:
+    from .travel import is_learning_eligible
+
+    record = compute_travel_record(payload)
+    return TravelCompleteResponse(
+        record=record,
+        learning_eligible=is_learning_eligible(record),
+        actual_travel_minutes=record.actual_travel_minutes,
+        early_minutes=record.early_minutes,
+        late_minutes=record.late_minutes,
+    )
+
+
+@app.post("/api/travel/metrics", response_model=TravelMetricsResponse)
+async def travel_metrics(payload: TravelMetricsRequest) -> TravelMetricsResponse:
+    return calculate_arrival_metrics(payload.records, payload.route_key)

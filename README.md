@@ -49,6 +49,42 @@ uvicorn backend.app.main:app --reload --port 8000
 
 장소/경로 API가 설정되지 않거나 실패하면 검색 실패 안내를 제공하고, 사용자가 직접 이동시간을 입력해 핵심 기능을 계속 사용할 수 있습니다. 조회된 경로 시간도 실시간 교통정보가 아닙니다.
 
+## 개인화 이동시간 백엔드 API
+
+FastAPI의 Swagger 화면(`http://localhost:8000/docs`)에서 아래 API를 호출할 수 있습니다. 기록은 서버에 저장되지 않습니다. 개인화 예측에 쓸 때마다 요청의 `history`에 유효한 이동기록을 전달해야 하며, 같은 요청 안에서는 `id`와 `run_id` 중복을 제거합니다. 별도 기록 저장소나 프런트엔드 연동은 포함하지 않았습니다.
+
+`/api/route`는 기존 `duration_minutes`, `source`, `transfers`, `fare`, `realtime`을 유지하고 `route_key`, `fetched_at`, `prediction_source`를 추가로 반환합니다. ODsay 응답에 `info.mapObj`가 있으면 `route_signature`로 전달하고 route key에 포함합니다. 이는 경로 그래픽용 서명으로 취급하며, 제공자 route ID라고 단정하지 않습니다. 서명이 없으면 약 100m 단위로 정규화한 양 끝 좌표 기반 route group을 사용합니다. [ODsay 공식 가이드 예시는 `info.mapObj`를 노선 그래픽 API 입력으로 사용합니다.](https://lab.odsay.com/guide/guide?platform=web)
+
+### 예측 및 통합 시간표
+
+```bash
+curl -X POST http://localhost:8000/api/travel/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"route_key":"sample-route","base_travel_minutes":70,"prediction_source":"api","strategy":"balanced","history":[]}'
+
+curl -X POST http://localhost:8000/api/travel/plan \
+  -H 'Content-Type: application/json' \
+  -d '{"route_key":"sample-route","base_travel_minutes":70,"prediction_source":"api","strategy":"balanced","history":[],"target_arrival_at":"2026-11-30T09:00:00+09:00","routine_minutes":65,"transition_minutes":5,"reserve_minutes":5,"arrival_buffer_minutes":5,"extra_travel_buffer_minutes":0}'
+```
+
+`efficient`, `balanced`, `safe` 전략의 비교값도 `/api/travel/predict` 응답에 포함됩니다. cold start의 교통 여유는 각각 5·10·20분입니다. 추천 출발 이동량은 `updated - previous` 부호이며 음수는 더 일찍 출발, 양수는 더 늦게 출발을 뜻합니다. 개인화 전략 여유는 `effective_travel_minutes`에 이미 포함되므로 별도 여유를 입력할 때 중복되지 않게 합니다.
+
+### 완료기록 및 분석
+
+```bash
+curl -X POST http://localhost:8000/api/travel/complete \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"trip-1","run_id":"run-1","route_key":"sample-route","target_arrival_at":"2026-11-30T09:00:00+09:00","recommended_departure_at":"2026-11-30T07:25:00+09:00","actual_departure_at":"2026-11-30T07:25:00+09:00","actual_arrival_at":"2026-11-30T08:53:00+09:00","api_travel_minutes":70,"predicted_travel_minutes":72,"effective_travel_minutes":82,"prediction_source":"api","strategy":"balanced","abnormal":false,"is_demo":false}'
+
+curl -X POST http://localhost:8000/api/travel/metrics \
+  -H 'Content-Type: application/json' \
+  -d '{"route_key":"sample-route","records":[]}'
+```
+
+`/api/travel/complete`은 시간 차이를 서버에서 계산합니다. `abnormal`, `is_demo`, 경유 기록, 수동 예측은 residual 학습에서 제외합니다. 중복 실행 방지는 전달된 history 목록 안에서 적용되며, stateless API는 이전 요청의 run ID를 기억하지 않습니다. 비정상·데모 기록은 API 요청의 데이터를 직접 수정하지 않습니다.
+
+가상 수도권 통학 시나리오를 실제 계산 함수로 재생하려면 저장소 루트에서 `backend/.venv/bin/python backend/demo_travel.py`를 실행합니다. 가상 기록은 프로세스 메모리에서만 사용하며 결과를 저장하지 않습니다. 기존 React 화면은 이 신규 API를 호출하지 않습니다.
+
 ## 구현된 기능
 
 - 반응형 홈, 일정/실행 화면, 습관 분석 화면과 하단 내비게이션
