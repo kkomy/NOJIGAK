@@ -50,6 +50,15 @@ export function predictDuration(routine, logs = [], context = '') {
   return { minutes: ceilMinutes(full), count: all.length, contextCount: matching.length, learned: all.length > 0 }
 }
 
+export function predictTransitionDuration(logs = [], minimumSamples = 5) {
+  const records = logs
+    .filter(log => validForLearning(log) && Number.isFinite(log.transitionDuration) && log.transitionDuration >= 0)
+    .map(log => ({ actual: log.transitionDuration }))
+  if (records.length < minimumSamples) return { minutes: 0, count: records.length, learned: false }
+  const estimate = ewma(records)
+  return { minutes: Math.max(0, Math.ceil(estimate - 1e-9)), count: records.length, learned: true }
+}
+
 export function initialAllocations(routines, logs = [], context = '') {
   return Object.fromEntries(routines.map(r => [r.id, predictDuration(r, logs, context).minutes]))
 }
@@ -67,14 +76,15 @@ const rank = priority => priority === 'optional' ? 0 : priority === 'normal' ? 1
 const rmin = r => Math.max(1, Number(r.minDuration) || 1, Number(r.flexibility) === 0 ? Number(r.predictedDuration) || 1 : 1)
 const availableCut = (routine, allocation) => Math.max(0, Math.floor((allocation - rmin(routine)) * routine.flexibility + 1e-9))
 
-export function rebalanceSchedule({ routines, allocations, initial = allocations, done = [], activeId = null, elapsedMinutes = 0, logs = [], deadlineMs, nowMs = Date.now(), reserve = 0, activeRemainingOverride }) {
+export function rebalanceSchedule({ routines, allocations, initial = allocations, done = [], activeId = null, elapsedMinutes = 0, logs = [], deadlineMs, nowMs = Date.now(), reserve = 0, activeRemainingOverride, transitionMinutes = 0 }) {
   const next = { ...allocations }, completed = new Set(done)
   const pending = routines.filter(r => !completed.has(r.id))
   const current = pending.find(r => r.id === activeId)
   const active = current ? activeRemaining(current, elapsedMinutes, next[current.id] ?? rmin(current), logs, activeRemainingOverride) : { minutes: 0, temporary: false }
   const future = pending.filter(r => r.id !== activeId)
   const secondsAvailable = Math.max(0, (deadlineMs - nowMs) / 60000)
-  const needed = active.minutes + future.reduce((sum, r) => sum + (next[r.id] ?? rmin(r)), 0) + reserve
+  const expectedTransitions = Math.max(0, pending.length - 1) * transitionMinutes
+  const needed = active.minutes + future.reduce((sum, r) => sum + (next[r.id] ?? rmin(r)), 0) + expectedTransitions + reserve
   let deficit = Math.max(0, needed - secondsAvailable)
   const reserveUsed = Math.min(reserve, deficit)
   let nextReserve = Math.max(0, reserve - reserveUsed)
@@ -115,14 +125,14 @@ export function rebalanceSchedule({ routines, allocations, initial = allocations
   return {
     allocations: next, reserve: nextReserve, changes, reserveUsed,
     activeRemainingMinutes: active.minutes, activeEstimateTemporary: active.temporary,
-    slackMinutes: secondsAvailable - active.minutes - future.reduce((sum, r) => sum + (next[r.id] ?? rmin(r)), 0),
+    slackMinutes: secondsAvailable - active.minutes - future.reduce((sum, r) => sum + (next[r.id] ?? rmin(r)), 0) - expectedTransitions,
     shortfallMinutes, proposedSkips, needsEmergency: shortfallMinutes > 1e-8,
     deficitBeforeCuts: originalDeficit,
   }
 }
 
-export function createEmergencyPlan({ routines, allocations, initial = allocations, done = [], activeId = null, elapsedMinutes = 0, logs = [], deadlineMs, nowMs = Date.now(), reserve = 0, activeRemainingOverride }) {
-  const normal = rebalanceSchedule({ routines, allocations, initial, done, activeId, elapsedMinutes, logs, deadlineMs, nowMs, reserve, activeRemainingOverride })
+export function createEmergencyPlan({ routines, allocations, initial = allocations, done = [], activeId = null, elapsedMinutes = 0, logs = [], deadlineMs, nowMs = Date.now(), reserve = 0, activeRemainingOverride, transitionMinutes = 0 }) {
+  const normal = rebalanceSchedule({ routines, allocations, initial, done, activeId, elapsedMinutes, logs, deadlineMs, nowMs, reserve, activeRemainingOverride, transitionMinutes })
   const next = { ...normal.allocations }, skip = []
   const pending = routines.filter(r => !done.includes(r.id) && r.id !== activeId)
   let left = normal.shortfallMinutes
@@ -134,12 +144,12 @@ export function createEmergencyPlan({ routines, allocations, initial = allocatio
   const emergency = rebalanceSchedule({
     routines: routines.filter(r => !skip.includes(r.id)), allocations: next, initial,
     done, activeId, elapsedMinutes, logs, deadlineMs, nowMs, reserve: normal.reserve,
-    activeRemainingOverride,
+    activeRemainingOverride, transitionMinutes,
   })
   return { ...emergency, skippedIds: skip, skippedMinutes: normal.shortfallMinutes - left, unavoidableMinutes: Math.max(0, emergency.shortfallMinutes), normal }
 }
 
-export function riskReport({ routines, allocations, done = [], activeId = null, elapsedMinutes = 0, logs = [], context = '', deadlineMs, nowMs = Date.now(), reserve = 0, simulations = RISK_THRESHOLDS.simulationCount, random = Math.random, activeRemainingOverride }) {
+export function riskReport({ routines, allocations, done = [], activeId = null, elapsedMinutes = 0, logs = [], context = '', deadlineMs, nowMs = Date.now(), reserve = 0, simulations = RISK_THRESHOLDS.simulationCount, random = Math.random, activeRemainingOverride, transitionMinutes = 0 }) {
   const completed = new Set(done), pending = routines.filter(r => !completed.has(r.id))
   const samples = new Map(), means = []
   for (const routine of pending) {
@@ -153,9 +163,11 @@ export function riskReport({ routines, allocations, done = [], activeId = null, 
       means.push(predictDuration(routine, logs, context).minutes)
     }
   }
-  const expectedMinutes = means.reduce((a, b) => a + b, 0)
+  const transitionReport = predictTransitionDuration(logs)
+  const transitionCount = Math.max(0, pending.length - 1)
+  const expectedMinutes = means.reduce((a, b) => a + b, 0) + transitionCount * transitionMinutes
   const slackMinutes = (deadlineMs - nowMs) / 60000 - expectedMinutes
-  const dataSufficient = pending.length > 0 && pending.every(r => (samples.get(r.id)?.length ?? 0) >= RISK_THRESHOLDS.minimumSamples)
+  const dataSufficient = pending.length > 0 && pending.every(r => (samples.get(r.id)?.length ?? 0) >= RISK_THRESHOLDS.minimumSamples) && (transitionCount === 0 || !transitionMinutes || transitionReport.count >= RISK_THRESHOLDS.minimumSamples)
   let probability = null
   if (dataSufficient) {
     let onTime = 0
@@ -165,6 +177,10 @@ export function riskReport({ routines, allocations, done = [], activeId = null, 
       for (const r of pending) {
         const list = samples.get(r.id)
         total += list[Math.min(list.length - 1, Math.floor(random() * list.length))]
+      }
+      if (transitionCount && transitionMinutes) {
+        const transitionSamples = logs.filter(log => validForLearning(log) && Number.isFinite(log.transitionDuration) && log.transitionDuration >= 0).slice(-20).map(log => log.transitionDuration / 60)
+        for (let index = 0; index < transitionCount; index++) total += transitionSamples[Math.min(transitionSamples.length - 1, Math.floor(random() * transitionSamples.length))]
       }
       if (total <= remainingDeadline) onTime++
     }

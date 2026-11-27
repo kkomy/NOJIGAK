@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createEmergencyPlan, initialAllocations, migrateRoutine, predictDuration, rebalanceSchedule, riskReport } from './adaptive.mjs'
+import { createEmergencyPlan, initialAllocations, migrateRoutine, predictDuration, predictTransitionDuration, rebalanceSchedule, riskReport } from './adaptive.mjs'
 
 const now = 1_800_000_000_000
 const routine = (id, extra = {}) => ({ id, name: id, base: 10, minDuration: 5, priority: 'normal', flexibility: 1, skippable: false, ...extra })
@@ -19,6 +19,41 @@ test('after reserve is exhausted, flexible work is reduced only within its minim
   assert.equal(result.reserve, 0)
   assert.equal(result.allocations.future, 8)
   assert.equal(result.shortfallMinutes, 0)
+})
+
+test('seven minute preparation delay uses five reserve minutes and cuts two minutes once', () => {
+  const routines = [
+    routine('shower', { base: 15, minDuration: 10, priority: 'required', flexibility: 0.7 }),
+    routine('meal', { base: 20, minDuration: 10, priority: 'optional', flexibility: 0.5 }),
+    routine('outfit', { base: 10, minDuration: 3, priority: 'optional', flexibility: 1 }),
+    routine('dress', { base: 15, minDuration: 7, priority: 'required', flexibility: 0.5 }),
+    routine('bag', { base: 5, minDuration: 2, priority: 'required', flexibility: 0.5 }),
+  ]
+  const initial = Object.fromEntries(routines.map(item => [item.id, item.base]))
+  const deadlineMs = now + 70 * 60_000
+  const delayedNow = now + 7 * 60_000
+  const first = rebalanceSchedule({ routines, allocations: initial, initial, activeId: 'shower', deadlineMs, nowMs: delayedNow, reserve: 5, reserveOriginal: 5 })
+  assert.equal(first.reserveUsed, 5)
+  assert.equal(Object.values(initial).reduce((sum, value) => sum + value, 0) - Object.values(first.allocations).reduce((sum, value) => sum + value, 0), 2)
+  const repeated = rebalanceSchedule({ routines, allocations: first.allocations, initial, activeId: 'shower', deadlineMs, nowMs: delayedNow, reserve: first.reserve, reserveOriginal: 5 })
+  assert.deepEqual(repeated.allocations, first.allocations)
+  assert.equal(repeated.reserve, first.reserve)
+})
+
+test('transition time is learned separately with EWMA and ignored before five records', () => {
+  const records = Array.from({ length: 5 }, (_, i) => ({ id: String(i), routineId: 'task', actual: 10 * 60, completed: true, skipped: false, transitionDuration: (i === 4 ? 240 : 120) }))
+  assert.deepEqual(predictTransitionDuration(records.slice(0, 4)), { minutes: 0, count: 4, learned: false })
+  assert.equal(predictTransitionDuration(records).learned, true)
+  assert.equal(predictTransitionDuration(records).minutes, 3)
+  assert.equal(predictTransitionDuration([...records, { ...records[0], id: 'compressed', executionMode: 'compressed' }]).count, 5)
+})
+
+test('remaining schedule includes expected transitions without changing routine allocations', () => {
+  const routines = [routine('first', { priority: 'required', minDuration: 10, flexibility: 0 }), routine('second', { priority: 'required', minDuration: 10, flexibility: 0 })]
+  const result = rebalanceSchedule({ routines, allocations: { first: 10, second: 10 }, initial: { first: 10, second: 10 }, activeId: 'first', deadlineMs: now + 20 * 60_000, nowMs: now, transitionMinutes: 2 })
+  assert.equal(result.allocations.first, 10)
+  assert.equal(result.allocations.second, 10)
+  assert.equal(result.shortfallMinutes, 2)
 })
 
 test('required routine minimum is preserved and remaining shortfall is explicit', () => {

@@ -7,6 +7,7 @@ export type RiskReport = { probability:number|null; dataSufficient:boolean; expe
 export type EmergencyPlan = RebalanceResult & { skippedIds:string[]; skippedMinutes:number; unavoidableMinutes:number; normal:RebalanceResult }
 export function migrateRoutine(raw:any): RoutineConfig
 export function predictDuration(routine:RoutineConfig, logs?:AdaptiveLog[], context?:string): { minutes:number; count:number; contextCount:number; learned:boolean }
+export function predictTransitionDuration(logs?:Array<AdaptiveLog & { transitionDuration?:number }>, minimumSamples?:number): { minutes:number; count:number; learned:boolean }
 export function initialAllocations(routines:RoutineConfig[], logs?:AdaptiveLog[], context?:string): Record<string,number>
 export function rebalanceSchedule(args:any): RebalanceResult
 export function createEmergencyPlan(args:any): EmergencyPlan
