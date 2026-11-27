@@ -6,7 +6,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 app = FastAPI(title="AI Departure Coach API", version="1.0.0")
 app.add_middleware(
@@ -21,6 +21,16 @@ app.add_middleware(
 class RouteRequest(BaseModel):
     origin: str = Field(min_length=1, max_length=200)
     destination: str = Field(min_length=1, max_length=200)
+    origin_lat: float | None = None
+    origin_lng: float | None = None
+
+    @model_validator(mode="after")
+    def validate_origin_coordinates(self) -> "RouteRequest":
+        if (self.origin_lat is None) != (self.origin_lng is None):
+            raise ValueError("origin_lat and origin_lng must be provided together")
+        if self.origin_lat is not None and not (-90 <= self.origin_lat <= 90 and -180 <= self.origin_lng <= 180):
+            raise ValueError("origin coordinates are out of range")
+        return self
 
 
 class PersonalizationRequest(BaseModel):
@@ -100,13 +110,12 @@ async def geocode(client: httpx.AsyncClient, query: str, key: str) -> tuple[floa
 async def route(payload: RouteRequest) -> dict[str, Any]:
     kakao = os.getenv("KAKAO_REST_API_KEY")
     odsay = os.getenv("ODSAY_API_KEY")
-    if not kakao or not odsay:
+    if not odsay or (payload.origin_lat is None and not kakao) or not kakao:
         raise HTTPException(status_code=503, detail="Route lookup keys are not configured")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            origin, destination = await __import__("asyncio").gather(
-                geocode(client, payload.origin, kakao), geocode(client, payload.destination, kakao)
-            )
+            destination = await geocode(client, payload.destination, kakao)
+            origin = (payload.origin_lng, payload.origin_lat) if payload.origin_lat is not None else await geocode(client, payload.origin, kakao)
             res = await client.get(
                 "https://api.odsay.com/v1/api/searchPubTransPathT",
                 params={"SX": origin[0], "SY": origin[1], "EX": destination[0], "EY": destination[1], "apiKey": odsay},
@@ -118,7 +127,13 @@ async def route(payload: RouteRequest) -> dict[str, Any]:
                 raise HTTPException(status_code=404, detail="No transit route found")
             path = paths[0]
             info = path.get("info", {})
-            return {"duration_minutes": int(info.get("totalTime", 0)), "source": "ODsay 대중교통 경로", "transfers": info.get("payment", 0) and max(0, len(path.get("subPath", [])) - 1), "fare": info.get("payment"), "realtime": False}
+            duration = info.get("totalTime")
+            if not isinstance(duration, (int, float)) or not np.isfinite(duration) or duration <= 0:
+                raise HTTPException(status_code=502, detail="Transit route returned an invalid duration")
+            rides = [part for part in path.get("subPath", []) if part.get("trafficType") in (1, 2)]
+            transfers = max(0, len(rides) - 1) if rides else None
+            payment = info.get("payment")
+            return {"duration_minutes": int(duration), "source": "ODsay 대중교통 경로", "transfers": transfers, "fare": payment if isinstance(payment, (int, float)) and payment > 0 else None, "realtime": False}
     except HTTPException:
         raise
     except httpx.HTTPError as exc:

@@ -56,6 +56,45 @@ test('remaining schedule includes expected transitions without changing routine 
   assert.equal(result.shortfallMinutes, 2)
 })
 
+test('repeated rebalance respects the original cumulative cut floor', () => {
+  const current = routine('current', { base: 10, minDuration: 10, flexibility: 0 })
+  const future = routine('future', { base: 20, minDuration: 10, flexibility: 0.5 })
+  const initial = { current: 10, future: 20 }
+  const first = rebalanceSchedule({ routines: [current, future], allocations: initial, initial, activeId: 'current', deadlineMs: now + 5 * 60_000, nowMs: now })
+  assert.equal(first.allocations.future, 15)
+  const repeated = rebalanceSchedule({ routines: [current, future], allocations: first.allocations, initial, activeId: 'current', deadlineMs: now + 5 * 60_000, nowMs: now })
+  assert.equal(repeated.allocations.future, 15)
+})
+
+test('initial allocations protect minimum duration and ignore non-finite values', () => {
+  const task = routine('task', { base: 20, minDuration: 25, flexibility: 0 })
+  assert.deepEqual(initialAllocations([task]), { task: 25 })
+  assert.equal(migrateRoutine({ id: 'bad', name: 'bad', base: Infinity }).base, 10)
+})
+
+test('deadline overrun remains negative and is reflected in the shortfall', () => {
+  const required = routine('required', { base: 10, minDuration: 10, priority: 'required', flexibility: 0 })
+  const result = rebalanceSchedule({ routines: [required], allocations: { required: 10 }, deadlineMs: now - 3 * 60_000, nowMs: now, reserve: 5 })
+  assert.equal(result.shortfallMinutes, 13)
+  assert.equal(result.reserve, 0)
+  const risk = riskReport({ routines: [required], allocations: { required: 10 }, deadlineMs: now - 3 * 60_000, nowMs: now })
+  assert.equal(risk.slackMinutes, -13)
+})
+
+test('active remaining override drives both expected time and Monte Carlo results', () => {
+  const task = routine('task')
+  const logs = Array.from({ length: 10 }, (_, i) => ({ id: String(i), routineId: 'task', actual: 5 * 60, planned: 10 * 60, completed: true, skipped: false }))
+  const result = riskReport({ routines: [task], allocations: { task: 10 }, activeId: 'task', activeRemainingOverride: 20, elapsedMinutes: 15, logs, deadlineMs: now + 10 * 60_000, nowMs: now, random: () => 0 })
+  assert.equal(result.expectedMinutes, 20)
+  assert.equal(result.probability, 0)
+})
+
+test('an in-progress transition subtracts elapsed time and is counted only once', () => {
+  const routines = [routine('first'), routine('second')]
+  const result = riskReport({ routines, allocations: { first: 10, second: 10 }, transitionMinutes: 5, transitionInProgress: true, transitionElapsedMinutes: 2, deadlineMs: now + 40 * 60_000, nowMs: now })
+  assert.equal(result.expectedMinutes, 28)
+})
+
 test('required routine minimum is preserved and remaining shortfall is explicit', () => {
   const must = routine('must', { priority: 'required', minDuration: 8 })
   const result = rebalanceSchedule({ routines: [must], allocations: { must: 10 }, deadlineMs: now + 5 * 60_000, nowMs: now })
