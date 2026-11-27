@@ -91,6 +91,8 @@ class TravelPredictRequest(BaseModel):
     prediction_source: PredictionSource = "api"
     strategy: TravelStrategy = "balanced"
     history: list[TravelRecord] = Field(default_factory=list, max_length=500)
+    # Explicitly scopes demo-marked fixtures to a stateless preview calculation.
+    demo_context: bool = False
 
     @field_validator("route_key")
     @classmethod

@@ -159,6 +159,22 @@ class TravelApiTests(unittest.TestCase):
         self.assertEqual(learned.json()["point_estimate_minutes"], 72)
         self.assertEqual(learned.json()["sample_count"], 1)
 
+    def test_plan_demo_context_is_explicit_and_preserves_default_demo_exclusion(self):
+        fixture = travel_record("demo-trip", "demo-run")
+        fixture["is_demo"] = True
+        payload = {
+            "route_key": "route-a", "base_travel_minutes": 70,
+            "prediction_source": "api", "strategy": "balanced", "history": [fixture],
+            "target_arrival_at": "2026-11-27T12:00:00+00:00", "routine_minutes": 60,
+            "reserve_minutes": 5, "arrival_buffer_minutes": 4,
+        }
+        ordinary = self.client.post("/api/travel/plan", json=payload)
+        demo = self.client.post("/api/travel/plan", json={**payload, "demo_context": True})
+        self.assertEqual(ordinary.status_code, 200, ordinary.text)
+        self.assertEqual(demo.status_code, 200, demo.text)
+        self.assertEqual(ordinary.json()["prediction"]["sample_count"], 0)
+        self.assertEqual(demo.json()["prediction"]["sample_count"], 1)
+
     def test_plan_completes_integrated_timeline_and_shift_sign(self):
         response = self.client.post("/api/travel/plan", json={
             "route_key": "route-a", "base_travel_minutes": 70,

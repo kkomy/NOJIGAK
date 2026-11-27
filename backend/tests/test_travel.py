@@ -9,6 +9,7 @@ from backend.app.travel import (
     calculate_arrival_metrics,
     compute_ewma,
     filter_valid_records,
+    is_learning_eligible,
     predict_travel_duration,
     recommend_departure,
     route_group_key,
@@ -92,6 +93,17 @@ class TravelRecordTests(unittest.TestCase):
 
 
 class TravelLearningTests(unittest.TestCase):
+    def test_demo_records_need_explicit_calculation_context(self):
+        fixture = record("demo", "demo-run", demo=True)
+        self.assertFalse(is_learning_eligible(fixture))
+        self.assertEqual(filter_valid_records([fixture], "route-a"), [])
+        self.assertEqual(filter_valid_records([fixture], "route-a", demo_context=True), [fixture])
+        self.assertTrue(is_learning_eligible(fixture, demo_context=True))
+        ordinary = predict_travel_duration("route-a", 70, "api", "balanced", [fixture])
+        demo = predict_travel_duration("route-a", 70, "api", "balanced", [fixture], demo_context=True)
+        self.assertEqual(ordinary.sample_count, 0)
+        self.assertEqual(demo.sample_count, 1)
+
     def test_coordinate_group_key_is_normalized_hashed_and_signature_aware(self):
         first = route_group_key((127.0001, 37.5001), (126.9001, 37.6001), "map-a")
         same_group = route_group_key((127.0002, 37.5002), (126.9002, 37.6002), "map-a")

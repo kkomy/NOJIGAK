@@ -69,6 +69,8 @@ curl -X POST http://localhost:8000/api/travel/plan \
 
 `efficient`, `balanced`, `safe` 전략의 비교값도 `/api/travel/predict` 응답에 포함됩니다. cold start의 교통 여유는 각각 5·10·20분입니다. 추천 출발 이동량은 `updated - previous` 부호이며 음수는 더 일찍 출발, 양수는 더 늦게 출발을 뜻합니다. 개인화 전략 여유는 `effective_travel_minutes`에 이미 포함되므로 별도 여유를 입력할 때 중복되지 않게 합니다.
 
+기본 예측은 `is_demo=true` 기록을 계속 제외합니다. 시연 전용 fixture 계산만 `demo_context: true`를 요청해 데모 표시가 붙은 기록을 일회성 stateless 계산에 포함할 수 있으며, 완료 기록 API와 영속 학습 정책에는 이 컨텍스트가 적용되지 않습니다.
+
 ### 완료기록 및 분석
 
 ```bash
@@ -97,6 +99,7 @@ curl -X POST http://localhost:8000/api/travel/metrics \
 - 정상 완료된 전환 기록 5회부터 EWMA 전환시간을 계획/재분배 시간에 포함하고, 유효 표본이 적으면 확률 대신 Slack 위험을 표시
 - 실행 화면의 출발 마감 카운트다운, 재분배 이유/예비시간/루틴 변경/예상 준비 완료/다음 행동 카드
 - 개인 저장 데이터를 바꾸지 않는 인터랙티브 데모와 실제 재분배·개인화 함수 실행
+- 홈의 `가상 시나리오 시작 — 78초 체험` 버튼으로 실행하는 자동 녹화용 데모; 가상 준비 기록은 `predictDuration()`/`initialAllocations()`로, 이동·출발 계획은 stateless `/api/travel/plan`으로 계산하고, 도착 후 가상 기록을 포함한 다음 계획을 다시 계산합니다. 화면의 GPS·경로·도착은 모두 시뮬레이션이며 개인 `localStorage`나 완료기록 API에 저장되지 않습니다.
 - 자기 예상/루틴 합계, 실제 평균, 시작 지연, 행동 전환, 주요 초과 루틴, 다음 일정 예상시간의 교정 리포트
 - 도착 시각에서 이동시간, 교통 여유, 도착 여유를 빼 출발 마감 계산
 - 기본 준비 루틴, 루틴 추가·이름/시간 수정·삭제·순서 변경

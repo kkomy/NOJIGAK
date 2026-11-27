@@ -77,10 +77,10 @@ def compute_travel_record(record: TravelRecord | dict) -> TravelRecord:
     return validate_travel_record(record)
 
 
-def is_learning_eligible(record: TravelRecord) -> bool:
+def is_learning_eligible(record: TravelRecord, demo_context: bool = False) -> bool:
     return (
         not record.abnormal
-        and not record.is_demo
+        and (demo_context or not record.is_demo)
         and not record.has_intermediate_stop
         and record.prediction_source == "api"
         and record.api_travel_minutes is not None
@@ -94,6 +94,7 @@ def filter_valid_records(
     records: Iterable[TravelRecord | dict],
     route_key: str | None = None,
     limit: int = MAX_RESIDUAL_HISTORY,
+    demo_context: bool = False,
 ) -> list[TravelRecord]:
     """Filter API-predicted records and de-duplicate both ID and run_id."""
     valid: list[TravelRecord] = []
@@ -104,7 +105,7 @@ def filter_valid_records(
             continue
         if route_key is not None and record.route_key != route_key:
             continue
-        if is_learning_eligible(record):
+        if is_learning_eligible(record, demo_context=demo_context):
             valid.append(record)
 
     valid.sort(key=lambda item: (item.actual_departure_at, item.id, item.run_id))
@@ -120,8 +121,10 @@ def filter_valid_records(
     return unique[-max(0, limit):] if limit else []
 
 
-def _ordered_residuals(records: Iterable[TravelRecord | dict], route_key: str) -> list[float]:
-    selected = filter_valid_records(records, route_key, MAX_RESIDUAL_HISTORY)
+def _ordered_residuals(
+    records: Iterable[TravelRecord | dict], route_key: str, demo_context: bool = False
+) -> list[float]:
+    selected = filter_valid_records(records, route_key, MAX_RESIDUAL_HISTORY, demo_context)
     return [record.actual_travel_minutes - float(record.api_travel_minutes) for record in selected]
 
 
@@ -141,6 +144,7 @@ def predict_travel_duration(
     prediction_source: Literal["api", "manual"],
     strategy: Literal["efficient", "balanced", "safe"] = "balanced",
     history: Iterable[TravelRecord | dict] = (),
+    demo_context: bool = False,
 ) -> TravelPredictResponse:
     """Blend route residual EWMA with a strategy quantile or cold-start margin."""
     if not isfinite(base_travel_minutes) or base_travel_minutes <= 0:
@@ -148,7 +152,7 @@ def predict_travel_duration(
     if strategy not in STRATEGIES:
         raise ValueError("unsupported travel strategy")
 
-    residuals = _ordered_residuals(history, route_key) if prediction_source == "api" else []
+    residuals = _ordered_residuals(history, route_key, demo_context) if prediction_source == "api" else []
     sample_count = len(residuals)
     ewma = compute_ewma(residuals)
     weight = sample_count / (sample_count + COLD_START_K) if sample_count else 0.0
@@ -208,7 +212,7 @@ def recommend_departure(
 ) -> TravelPlanResponse:
     prediction = prediction or predict_travel_duration(
         request.route_key, request.base_travel_minutes, request.prediction_source,
-        request.strategy, request.history,
+        request.strategy, request.history, request.demo_context,
     )
     # The strategy margin is already part of effective_travel_minutes. Only
     # separately selected arrival and travel buffers are subtracted here.

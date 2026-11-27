@@ -176,6 +176,7 @@ async def travel_predict(payload: TravelPredictRequest) -> TravelPredictResponse
         prediction_source=payload.prediction_source,
         strategy=payload.strategy,
         history=payload.history,
+        demo_context=payload.demo_context,
     )
 
 
